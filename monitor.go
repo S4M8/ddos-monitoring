@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -25,10 +26,20 @@ type NetworkMonitor struct {
 	monitoredEndpoints []string
 	networkInterface   string
 	programSend        func(tea.Msg)
+	whitelistedIPs     map[string]bool
 }
 
 func (nm *NetworkMonitor) SetProgramSend(send func(tea.Msg)) {
 	nm.programSend = send
+}
+
+func (nm *NetworkMonitor) SetWhitelistedIPs(ips []string) {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	nm.whitelistedIPs = make(map[string]bool)
+	for _, ip := range ips {
+		nm.whitelistedIPs[ip] = true
+	}
 }
 
 type IPStats struct {
@@ -38,6 +49,7 @@ type IPStats struct {
 	WindowStart    time.Time
 	SuspiciousFlag bool
 	Protocols      map[string]int64
+	Domain         string // Added for domain resolution
 }
 
 type PortStats struct {
@@ -56,6 +68,7 @@ func NewNetworkMonitor(thresholdPPS int64, thresholdBandwidth int64, monitoredEn
 		metrics:            NewMetricsCollector(),
 		monitoredEndpoints: monitoredEndpoints,
 		networkInterface:   networkInterface,
+		whitelistedIPs:     make(map[string]bool), // Initialize whitelistedIPs
 	}
 }
 
@@ -164,6 +177,18 @@ func (nm *NetworkMonitor) processPacket(packet gopacket.Packet) {
 	stats.LastSeen = now
 	stats.Protocols[protocol]++
 
+	// Perform reverse DNS lookup asynchronously
+	if stats.Domain == "" {
+		go func(ip string, s *IPStats) {
+			names, err := net.LookupAddr(ip)
+			if err == nil && len(names) > 0 {
+				s.Domain = names[0]
+			} else {
+				s.Domain = "N/A"
+			}
+		}(srcIP, stats)
+	}
+
 	if dstPort > 0 {
 		portStats, exists := nm.portStats[dstPort]
 		if !exists {
@@ -200,6 +225,7 @@ func (nm *NetworkMonitor) detectSuspiciousActivity() {
 	ppsStats := make(map[string]float64)
 	bpsStats := make(map[string]float64)
 	protocolStats := make(map[string]map[string]int64)
+	domainStats := make(map[string]string) // Added for domain stats
 	suspiciousIPs := make(map[string]int64)
 	totalBPS := float64(0)
 
@@ -222,6 +248,7 @@ func (nm *NetworkMonitor) detectSuspiciousActivity() {
 		ppsStats[ip] = pps
 		bpsStats[ip] = bps
 		protocolStats[ip] = stats.Protocols
+		domainStats[ip] = stats.Domain // Store domain
 		totalBPS += bps
 
 		suspicious := pps > float64(nm.thresholdPPS) || bps > float64(nm.thresholdBandwidth)
@@ -244,14 +271,19 @@ func (nm *NetworkMonitor) detectSuspiciousActivity() {
 		}
 
 		if suspicious && !stats.SuspiciousFlag {
-			alertMsgText := fmt.Sprintf("ALERT: Suspicious activity from %s - PPS: %.2f, BPS: %.2f", ip, pps, bps)
-			log.Println(alertMsgText) // Keep in log for debugging/persistence
-			if nm.programSend != nil {
-				nm.programSend(alertMsg(alertMsgText))
+			// Check if the IP is whitelisted
+			if nm.whitelistedIPs[ip] {
+				log.Printf("INFO: Whitelisted IP %s exceeded thresholds (PPS: %.2f, BPS: %.2f)", ip, pps, bps)
+			} else {
+				alertMsgText := fmt.Sprintf("ALERT: Suspicious activity from %s - PPS: %.2f, BPS: %.2f", ip, pps, bps)
+				log.Println(alertMsgText) // Keep in log for debugging/persistence
+				if nm.programSend != nil {
+					nm.programSend(alertMsg(alertMsgText))
+				}
+				log.Printf("  Protocols: %v", stats.Protocols)
+				suspiciousCount++
+				LogSuspiciousEvent(ip, "DDoS_Attack_Detected", fmt.Sprintf("PPS: %.2f, BPS: %.2f", pps, bps))
 			}
-			log.Printf("  Protocols: %v", stats.Protocols)
-			suspiciousCount++
-			LogSuspiciousEvent(ip, "DDoS_Attack_Detected", fmt.Sprintf("PPS: %.2f, BPS: %.2f", pps, bps))
 		}
 
 		stats.SuspiciousFlag = suspicious
@@ -269,6 +301,7 @@ func (nm *NetworkMonitor) detectSuspiciousActivity() {
 	nm.metrics.Set("ddos_bytes_per_second_total", totalBPS)
 	nm.metrics.Set("ddos_bytes_per_second_per_ip", bpsStats)
 	nm.metrics.Set("ddos_protocols_per_ip", protocolStats)
+	nm.metrics.Set("ddos_domains_per_ip", domainStats) // Expose domain stats
 	nm.metrics.Set("ddos_suspicious_ips", suspiciousIPs)
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -13,6 +14,7 @@ var (
 	tableHeaderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Bold(true)
 	rowStyle         = lipgloss.NewStyle().PaddingRight(2)
 	suspiciousStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true) // Red color
+	footerStyle      = lipgloss.NewStyle().Padding(1, 2).BorderTop(true).BorderStyle(lipgloss.NormalBorder())
 )
 
 type ipTableRow struct {
@@ -20,6 +22,7 @@ type ipTableRow struct {
 	PPS        float64
 	BPS        float64
 	Protocols  string
+	Domain     string // Added for domain
 	Suspicious bool
 }
 
@@ -30,9 +33,15 @@ type model struct {
 	height        int
 	ipData        []ipTableRow // Data for the IP table
 	recentAlerts  []string     // Stores recent alerts
-	sortColumn    string       // Current column being sorted (e.g., "IP", "PPS", "BPS", "Protocols")
+	sortColumn    string       // Current column being sorted (e.g., "IP", "PPS", "BPS", "Protocols", "Domain", "Suspicious")
 	sortAscending bool         // True for ascending, false for descending
+	currentView   string       // Current view: "table", "suspicious"
 }
+
+const (
+	ViewTable      = "default"
+	ViewSuspicious = "suspicious"
+)
 
 type alertMsg string
 
@@ -43,6 +52,7 @@ func NewModel(monitor *NetworkMonitor) tea.Model {
 		recentAlerts:  make([]string, 0, 5), // Initialize with capacity
 		sortColumn:    "PPS",                // Default sort column
 		sortAscending: false,                // Default sort order (descending for PPS)
+		currentView:   ViewTable,            // Default view
 	}
 }
 
@@ -60,46 +70,72 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "v": // Toggle views
+			if m.currentView == ViewTable {
+				m.currentView = ViewSuspicious
+			} else {
+				m.currentView = ViewTable
+			}
 		case "1": // Sort by IP
-			if m.sortColumn == "IP" {
-				m.sortAscending = !m.sortAscending
-			} else {
-				m.sortColumn = "IP"
-				m.sortAscending = true
+			if m.currentView == ViewTable {
+				if m.sortColumn == "IP" {
+					m.sortAscending = !m.sortAscending
+				} else {
+					m.sortColumn = "IP"
+					m.sortAscending = true
+				}
+				m.sortIPData()
 			}
-			m.sortIPData()
 		case "2": // Sort by PPS
-			if m.sortColumn == "PPS" {
-				m.sortAscending = !m.sortAscending
-			} else {
-				m.sortColumn = "PPS"
-				m.sortAscending = false // Default to descending for PPS
+			if m.currentView == ViewTable {
+				if m.sortColumn == "PPS" {
+					m.sortAscending = !m.sortAscending
+				} else {
+					m.sortColumn = "PPS"
+					m.sortAscending = false // Default to descending for PPS
+				}
+				m.sortIPData()
 			}
-			m.sortIPData()
 		case "3": // Sort by BPS
-			if m.sortColumn == "BPS" {
-				m.sortAscending = !m.sortAscending
-			} else {
-				m.sortColumn = "BPS"
-				m.sortAscending = false // Default to descending for BPS
+			if m.currentView == ViewTable {
+				if m.sortColumn == "BPS" {
+					m.sortAscending = !m.sortAscending
+				} else {
+					m.sortColumn = "BPS"
+					m.sortAscending = false // Default to descending for BPS
+				}
+				m.sortIPData()
 			}
-			m.sortIPData()
 		case "4": // Sort by Protocols
-			if m.sortColumn == "Protocols" {
-				m.sortAscending = !m.sortAscending
-			} else {
-				m.sortColumn = "Protocols"
-				m.sortAscending = true
+			if m.currentView == ViewTable {
+				if m.sortColumn == "Protocols" {
+					m.sortAscending = !m.sortAscending
+				} else {
+					m.sortColumn = "Protocols"
+					m.sortAscending = true
+				}
+				m.sortIPData()
 			}
-			m.sortIPData()
+		case "5": // Sort by Domain
+			if m.currentView == ViewTable {
+				if m.sortColumn == "Domain" {
+					m.sortAscending = !m.sortAscending
+				} else {
+					m.sortColumn = "Domain"
+					m.sortAscending = true
+				}
+				m.sortIPData()
+			}
 		case "s": // Sort by Suspicious
-			if m.sortColumn == "Suspicious" {
-				m.sortAscending = !m.sortAscending
-			} else {
-				m.sortColumn = "Suspicious"
-				m.sortAscending = false // Default to descending (suspicious first)
+			if m.currentView == ViewTable {
+				if m.sortColumn == "Suspicious" {
+					m.sortAscending = !m.sortAscending
+				} else {
+					m.sortColumn = "Suspicious"
+					m.sortAscending = false // Default to descending (suspicious first)
+				}
+				m.sortIPData()
 			}
-			m.sortIPData()
 		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -135,6 +171,10 @@ func (m *model) updateIPData() {
 	if !ok {
 		protocolStats = make(map[string]map[string]int64)
 	}
+	domainStats, ok := stats["ddos_domains_per_ip"].(map[string]string) // Get domain stats
+	if !ok {
+		domainStats = make(map[string]string)
+	}
 	suspiciousIPs, ok := stats["ddos_suspicious_ips"].(map[string]int64)
 	if !ok {
 		suspiciousIPs = make(map[string]int64)
@@ -144,6 +184,7 @@ func (m *model) updateIPData() {
 	for ip, pps := range ppsStats {
 		bps := bpsPerIPStats[ip]
 		isSuspicious := suspiciousIPs[ip] == 1
+		domain := domainStats[ip] // Get domain for this IP
 
 		// Format protocols for display
 		protocols := ""
@@ -161,6 +202,7 @@ func (m *model) updateIPData() {
 			PPS:        pps,
 			BPS:        bps,
 			Protocols:  protocols,
+			Domain:     domain, // Assign domain
 			Suspicious: isSuspicious,
 		})
 	}
@@ -199,12 +241,18 @@ func (m *model) sortIPData() {
 			} else {
 				return a.Protocols > b.Protocols
 			}
+		case "Domain": // Sort by Domain
+			if sortOrder {
+				return a.Domain < b.Domain
+			} else {
+				return a.Domain > b.Domain
+			}
 		case "Suspicious":
 			// Sort suspicious items first if descending, or last if ascending
 			if sortOrder {
-				return a.Suspicious == false && b.Suspicious == true
+				return !a.Suspicious && b.Suspicious
 			} else {
-				return a.Suspicious == true && b.Suspicious == false
+				return a.Suspicious && !b.Suspicious
 			}
 		}
 		return false // Should not happen
@@ -217,73 +265,113 @@ func (m model) View() string {
 		return "Initializing..."
 	}
 
-	s := "DDoS Monitoring Dashboard\n\n"
-
+	var s strings.Builder
 	stats := m.monitor.metrics.GetAll()
 
 	// Overall Statistics
 	activeConnections := stats["ddos_active_connections"]
-	s += fmt.Sprintf("Active Connections: %v\n", activeConnections)
 	suspiciousCount := stats["ddos_suspicious_count"]
-	s += fmt.Sprintf("Suspicious Traffic: %v\n", suspiciousCount)
 	bps := stats["ddos_bytes_per_second_total"]
+
+	s.WriteString("DDoS Monitoring Dashboard\n\n")
+	s.WriteString(fmt.Sprintf("Active Connections: %v\n", activeConnections))
+	s.WriteString(fmt.Sprintf("Suspicious Traffic: %v\n", suspiciousCount))
 	if totalBPS, ok := bps.(float64); ok {
-		s += fmt.Sprintf("Total Bytes per Second (BPS): %.2f\n\n", totalBPS)
+		s.WriteString(fmt.Sprintf("Total Bytes per Second (BPS): %.2f\n\n", totalBPS))
 	} else {
-		s += fmt.Sprintf("Total Bytes per Second (BPS): N/A\n\n")
+		s.WriteString("Total Bytes per Second (BPS): N/A\n\n")
 	}
 
 	// Monitored Endpoints
 	if len(m.monitor.monitoredEndpoints) > 0 {
-		s += fmt.Sprintf("Monitored Endpoints:\n")
+		s.WriteString("Monitored Endpoints:\n")
 		for _, endpoint := range m.monitor.monitoredEndpoints {
-			s += fmt.Sprintf("  - %s\n", endpoint)
+			s.WriteString(fmt.Sprintf("  - %s\n", endpoint))
 		}
-		s += "\n"
+		s.WriteString("\n")
 	}
 
-	// IP Statistics Table Header with sort indicators
-	ipHeader := fmt.Sprintf("%-20s %-12s %-18s %-25s %-12s", "IP Address", "PPS", "BPS", "Protocols", "Suspicious")
-	if m.sortColumn != "" {
-		sortIndicator := "▲" // Ascending
-		if !m.sortAscending {
-			sortIndicator = "▼" // Descending
+	// Current View Label
+	viewLabel := "Current View: " + strings.Title(m.currentView) + "\n\n"
+	s.WriteString(viewLabel)
+
+	// Main content area based on current view
+	mainContent := ""
+	switch m.currentView {
+	case ViewTable:
+		// IP Statistics Table Header with sort indicators
+		ipHeader := fmt.Sprintf("%-20s %-12s %-18s %-25s %-30s", "IP Address", "PPS", "BPS", "Protocols", "Domain")
+		if m.sortColumn != "" {
+			sortIndicator := "▲" // Ascending
+			if !m.sortAscending {
+				sortIndicator = "▼" // Descending
+			}
+			switch m.sortColumn {
+			case "IP":
+				ipHeader = fmt.Sprintf("%-20s %-12s %-18s %-25s %-30s", "IP Address "+sortIndicator, "PPS", "BPS", "Protocols", "Domain")
+			case "PPS":
+				ipHeader = fmt.Sprintf("%-20s %-12s %-18s %-25s %-30s", "IP Address", "PPS "+sortIndicator, "BPS", "Protocols", "Domain")
+			case "BPS":
+				ipHeader = fmt.Sprintf("%-20s %-12s %-18s %-25s %-30s", "IP Address", "PPS", "BPS "+sortIndicator, "Protocols", "Domain")
+			case "Protocols":
+				ipHeader = fmt.Sprintf("%-20s %-12s %-18s %-25s %-30s", "IP Address", "PPS", "BPS", "Protocols "+sortIndicator, "Domain")
+			case "Domain":
+				ipHeader = fmt.Sprintf("%-20s %-12s %-18s %-25s %-30s", "IP Address", "PPS", "BPS", "Protocols", "Domain "+sortIndicator)
+			}
 		}
-		switch m.sortColumn {
-		case "IP":
-			ipHeader = fmt.Sprintf("%-20s %-12s %-18s %-25s %-12s", "IP Address "+sortIndicator, "PPS", "BPS", "Protocols", "Suspicious")
-		case "PPS":
-			ipHeader = fmt.Sprintf("%-20s %-12s %-18s %-25s %-12s", "IP Address", "PPS "+sortIndicator, "BPS", "Protocols", "Suspicious")
-		case "BPS":
-			ipHeader = fmt.Sprintf("%-20s %-12s %-18s %-25s %-12s", "IP Address", "PPS", "BPS "+sortIndicator, "Protocols", "Suspicious")
-		case "Protocols":
-			ipHeader = fmt.Sprintf("%-20s %-12s %-18s %-25s %-12s", "IP Address", "PPS", "BPS", "Protocols "+sortIndicator, "Suspicious")
-		case "Suspicious":
-			ipHeader = fmt.Sprintf("%-20s %-12s %-18s %-25s %-12s", "IP Address", "PPS", "BPS", "Protocols", "Suspicious "+sortIndicator)
+		mainContent += tableHeaderStyle.Render(ipHeader) + "\n"
+
+		for _, row := range m.ipData {
+			line := fmt.Sprintf("%-20s %-12.2f %-18.2f %-25s %-30s", row.IP, row.PPS, row.BPS, row.Protocols, m.truncateDomain(row.Domain, 28))
+			if row.Suspicious {
+				line = suspiciousStyle.Render(line)
+			}
+			mainContent += rowStyle.Render(line) + "\n"
+		}
+
+	case ViewSuspicious:
+		// Render suspicious IPs table
+		suspiciousIPsMap, ok := stats["ddos_suspicious_ips"].(map[string]int64)
+		if !ok {
+			suspiciousIPsMap = make(map[string]int64)
+		}
+
+		var suspiciousRows []ipTableRow
+		for _, row := range m.ipData {
+			if suspiciousIPsMap[row.IP] == 1 {
+				suspiciousRows = append(suspiciousRows, row)
+			}
+		}
+
+		mainContent += tableHeaderStyle.Render(fmt.Sprintf("%-20s %-12s %-18s %-25s %-30s", "IP Address", "PPS", "BPS", "Protocols", "Domain")) + "\n"
+		for _, row := range suspiciousRows {
+			line := fmt.Sprintf("%-20s %-12.2f %-18.2f %-25s %-30s", row.IP, row.PPS, row.BPS, row.Protocols, m.truncateDomain(row.Domain, 28))
+			if row.Suspicious {
+				line = suspiciousStyle.Render(line)
+			}
+			mainContent += rowStyle.Render(line) + "\n"
 		}
 	}
-	s += tableHeaderStyle.Render(ipHeader) + "\n"
 
-	for _, row := range m.ipData {
-		line := fmt.Sprintf("%-20s %-12.2f %-18.2f %-25s %-12t", row.IP, row.PPS, row.BPS, row.Protocols, row.Suspicious)
-		if row.Suspicious {
-			line = suspiciousStyle.Render(line)
-		}
-		s += rowStyle.Render(line) + "\n"
-	}
-
-	s += "\n"
+	s.WriteString(mainContent)
+	s.WriteString("\n")
 
 	// Recent Alerts
 	if len(m.recentAlerts) > 0 {
-		s += "Recent Alerts:\n"
+		s.WriteString("Recent Alerts:\n")
 		for _, alert := range m.recentAlerts {
-			s += fmt.Sprintf("  - %s\n", alert)
+			s.WriteString(fmt.Sprintf("  - %s\n", alert))
 		}
-		s += "\n"
+		s.WriteString("\n")
 	}
 
-	s += "Press 1-4 to sort by column, 's' for Suspicious, 'q' to quit.\n" // Add sorting instructions
+	// Controls (fixed at the bottom)
+	nextView := ViewSuspicious
+	if m.currentView == ViewSuspicious {
+		nextView = ViewTable
+	}
+	controls := fmt.Sprintf("Press 'v' to change view to %s, 1-5 to sort by column, 'q' to quit.", strings.Title(nextView))
+	s.WriteString(footerStyle.Render(controls))
 
 	style := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
@@ -292,7 +380,14 @@ func (m model) View() string {
 		Width(m.width - 4).
 		Height(m.height - 4)
 
-	return style.Render(s)
+	return style.Render(s.String())
+}
+
+func (m model) truncateDomain(domain string, maxLength int) string {
+	if len(domain) <= maxLength {
+		return domain
+	}
+	return domain[:maxLength-3] + "..."
 }
 
 type tickMsg time.Time
