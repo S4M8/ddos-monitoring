@@ -12,9 +12,9 @@ import (
 var selectedItemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("170"))
 
 type interfaceSelectorModel struct {
-	choices  []pcap.Interface // Items on the to-do list
-	cursor   int              // Which to-do list item our cursor is pointing at
-	selected string           // Which to-do list item are we selected?
+	choices  []pcap.Interface
+	cursor   int
+	selected string
 	quitting bool
 }
 
@@ -84,9 +84,9 @@ func (m interfaceSelectorModel) View() string {
 
 		line := fmt.Sprintf("[%s] %s", choice.Name, description)
 
-		cursor := " " // no cursor
+		cursor := " "
 		if m.cursor == i {
-			cursor = ">" // cursor!
+			cursor = ">"
 			line = selectedItemStyle.Render(line)
 		}
 

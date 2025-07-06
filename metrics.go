@@ -1,9 +1,9 @@
 package main
 
 import (
-    "fmt"
-    "net/http"
-    "sync"
+	"fmt"
+	"net/http"
+	"sync"
 )
 
 type MetricsCollector struct {

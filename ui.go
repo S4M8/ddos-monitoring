@@ -299,12 +299,11 @@ func (m model) View() string {
 	mainContent := ""
 	switch m.currentView {
 	case ViewTable:
-		// IP Statistics Table Header with sort indicators
 		ipHeader := fmt.Sprintf("%-20s %-12s %-18s %-25s %-30s", "IP Address", "PPS", "BPS", "Protocols", "Domain")
 		if m.sortColumn != "" {
-			sortIndicator := "▲" // Ascending
+			sortIndicator := "▲"
 			if !m.sortAscending {
-				sortIndicator = "▼" // Descending
+				sortIndicator = "▼"
 			}
 			switch m.sortColumn {
 			case "IP":
