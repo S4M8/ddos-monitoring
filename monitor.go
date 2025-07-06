@@ -47,10 +47,8 @@ func NewNetworkMonitor(thresholdPPS int, thresholdBandwidth int64) *NetworkMonit
 }
 
 func (nm *NetworkMonitor) Start(ctx context.Context) error {
-	// Create raw socket to capture IP packets
 	conn, err := net.ListenPacket("ip4:tcp", "0.0.0.0")
 	if err != nil {
-		// Try UDP if TCP fails
 		conn, err = net.ListenPacket("ip4:udp", "0.0.0.0")
 		if err != nil {
 			return fmt.Errorf("failed to create raw socket: %v", err)
@@ -61,13 +59,9 @@ func (nm *NetworkMonitor) Start(ctx context.Context) error {
 	log.Println("Started network monitoring with raw sockets")
 	log.Printf("Thresholds: %d PPS, %d bytes/sec", nm.thresholdPPS, nm.thresholdBandwidth)
 
-	// Start cleanup routine
 	go nm.cleanup(ctx)
-
-	// Start analysis routine
 	go nm.analyzeTraffic(ctx)
 
-	// Start packet capture loop
 	buffer := make([]byte, 65536)
 	for {
 		select {
@@ -102,7 +96,6 @@ func (nm *NetworkMonitor) processPacket(data []byte, addr net.Addr) {
 	var protocol string
 	packetSize := int64(len(data))
 
-	// Parse transport layer based on protocol
 	headerLen := int(ipHeader.IHL * 4)
 	if len(data) < headerLen {
 		return
@@ -129,7 +122,6 @@ func (nm *NetworkMonitor) processPacket(data []byte, addr net.Addr) {
 
 	now := time.Now()
 
-	// Update IP stats
 	stats, exists := nm.ipStats[srcIP]
 	if !exists {
 		stats = &IPStats{
@@ -140,7 +132,6 @@ func (nm *NetworkMonitor) processPacket(data []byte, addr net.Addr) {
 		nm.ipStats[srcIP] = stats
 	}
 
-	// Reset window if needed
 	if now.Sub(stats.WindowStart) > nm.windowSize {
 		stats.WindowStart = now
 		stats.PacketCount = 0
@@ -152,7 +143,6 @@ func (nm *NetworkMonitor) processPacket(data []byte, addr net.Addr) {
 	stats.LastSeen = now
 	stats.Protocols[protocol]++
 
-	// Update port stats
 	if dstPort > 0 {
 		portStats, exists := nm.portStats[dstPort]
 		if !exists {
@@ -188,6 +178,7 @@ func (nm *NetworkMonitor) detectSuspiciousActivity() {
 	suspiciousCount := int64(0)
 	ppsStats := make(map[string]float64)
 	suspiciousIPs := make(map[string]int64)
+	totalBPS := float64(0)
 
 	for ip, stats := range nm.ipStats {
 		if now.Sub(stats.LastSeen) > time.Minute {
@@ -204,8 +195,8 @@ func (nm *NetworkMonitor) detectSuspiciousActivity() {
 		bps := float64(stats.ByteCount) / windowDuration
 
 		ppsStats[ip] = pps
+		totalBPS += bps
 
-		// Check thresholds
 		suspicious := pps > float64(nm.thresholdPPS) || bps > float64(nm.thresholdBandwidth)
 
 		if suspicious && !stats.SuspiciousFlag {
@@ -223,11 +214,11 @@ func (nm *NetworkMonitor) detectSuspiciousActivity() {
 		}
 	}
 
-	// Update metrics
 	nm.metrics.Set("ddos_active_connections", activeCount)
 	nm.metrics.Set("ddos_suspicious_count", suspiciousCount)
 	nm.metrics.Set("ddos_packets_per_second", ppsStats)
 	nm.metrics.Set("ddos_suspicious_ips", suspiciousIPs)
+	nm.metrics.Set("ddos_bytes_per_second", totalBPS)
 }
 
 func (nm *NetworkMonitor) cleanup(ctx context.Context) {
@@ -242,14 +233,12 @@ func (nm *NetworkMonitor) cleanup(ctx context.Context) {
 			nm.mu.Lock()
 			now := time.Now()
 
-			// Clean old IP stats
 			for ip, stats := range nm.ipStats {
 				if now.Sub(stats.LastSeen) > 10*time.Minute {
 					delete(nm.ipStats, ip)
 				}
 			}
 
-			// Clean old port stats
 			for port, stats := range nm.portStats {
 				if now.Sub(stats.LastSeen) > 10*time.Minute {
 					delete(nm.portStats, port)
