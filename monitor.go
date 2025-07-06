@@ -2,22 +2,33 @@ package main
 
 import (
 	"context"
-	"log"
-	"net"
-	"sync"
 	"fmt"
+	"log"
+	"sync"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 )
 
 type NetworkMonitor struct {
 	mu                 sync.RWMutex
 	ipStats            map[string]*IPStats
 	portStats          map[uint16]*PortStats
-	conn               net.PacketConn
-	thresholdPPS       int
+	handle             *pcap.Handle
+	thresholdPPS       int64
 	thresholdBandwidth int64
 	windowSize         time.Duration
 	metrics            *MetricsCollector
+	monitoredEndpoints []string
+	networkInterface   string
+	programSend        func(tea.Msg)
+}
+
+func (nm *NetworkMonitor) SetProgramSend(send func(tea.Msg)) {
+	nm.programSend = send
 }
 
 type IPStats struct {
@@ -35,7 +46,7 @@ type PortStats struct {
 	LastSeen    time.Time
 }
 
-func NewNetworkMonitor(thresholdPPS int, thresholdBandwidth int64) *NetworkMonitor {
+func NewNetworkMonitor(thresholdPPS int64, thresholdBandwidth int64, monitoredEndpoints []string, networkInterface string) *NetworkMonitor {
 	return &NetworkMonitor{
 		ipStats:            make(map[string]*IPStats),
 		portStats:          make(map[uint16]*PortStats),
@@ -43,78 +54,88 @@ func NewNetworkMonitor(thresholdPPS int, thresholdBandwidth int64) *NetworkMonit
 		thresholdBandwidth: thresholdBandwidth,
 		windowSize:         time.Minute,
 		metrics:            NewMetricsCollector(),
+		monitoredEndpoints: monitoredEndpoints,
+		networkInterface:   networkInterface,
 	}
 }
 
 func (nm *NetworkMonitor) Start(ctx context.Context) error {
-	conn, err := net.ListenPacket("ip4:tcp", "0.0.0.0")
-	if err != nil {
-		conn, err = net.ListenPacket("ip4:udp", "0.0.0.0")
+	var err error
+	if nm.networkInterface == "" {
+		log.Println("No network interface specified. Attempting to find a suitable one...")
+		devices, err := pcap.FindAllDevs()
 		if err != nil {
-			return fmt.Errorf("failed to create raw socket: %v", err)
+			return fmt.Errorf("error finding devices: %v", err)
+		}
+		for _, device := range devices {
+			if len(device.Addresses) > 0 {
+				nm.networkInterface = device.Name
+				log.Printf("Using network interface: %s", nm.networkInterface)
+				break
+			}
+		}
+		if nm.networkInterface == "" {
+			return fmt.Errorf("no suitable network interface found. Please specify one using -interface flag or in config.yaml")
 		}
 	}
-	nm.conn = conn
 
-	log.Println("Started network monitoring with raw sockets")
+	nm.handle, err = pcap.OpenLive(nm.networkInterface, 1600, true, 30*time.Second) // 30-second timeout
+	if err != nil {
+		return fmt.Errorf("error opening device %s: %v", nm.networkInterface, err)
+	}
+	defer nm.handle.Close()
+
+	log.Printf("Started network monitoring on interface %s", nm.networkInterface)
 	log.Printf("Thresholds: %d PPS, %d bytes/sec", nm.thresholdPPS, nm.thresholdBandwidth)
 
 	go nm.cleanup(ctx)
 	go nm.analyzeTraffic(ctx)
 
-	buffer := make([]byte, 65536)
+	packetSource := gopacket.NewPacketSource(nm.handle, nm.handle.LinkType())
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		default:
-			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			n, addr, err := conn.ReadFrom(buffer)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue
-				}
-				log.Printf("Error reading packet: %v", err)
-				continue
-			}
-			nm.processPacket(buffer[:n], addr)
+		case packet := <-packetSource.Packets():
+			nm.processPacket(packet)
 		}
 	}
 }
 
-func (nm *NetworkMonitor) processPacket(data []byte, addr net.Addr) {
+func (nm *NetworkMonitor) processPacket(packet gopacket.Packet) {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
 
-	ipHeader, err := parseIPv4Header(data)
-	if err != nil {
+	ipLayer := packet.Layer(layers.LayerTypeIPv4)
+	if ipLayer == nil {
+		return
+	}
+	ip, ok := ipLayer.(*layers.IPv4)
+	if !ok {
 		return
 	}
 
-	srcIP := ipHeader.SrcIP.String()
+	srcIP := ip.SrcIP.String()
 	var dstPort uint16
 	var protocol string
-	packetSize := int64(len(data))
+	packetSize := int64(packet.Metadata().Length)
 
-	headerLen := int(ipHeader.IHL * 4)
-	if len(data) < headerLen {
-		return
-	}
-
-	payload := data[headerLen:]
-
-	switch ipHeader.Protocol {
-	case 6: // TCP
-		if tcpHeader, err := parseTCPHeader(payload); err == nil {
-			dstPort = tcpHeader.DstPort
-			protocol = "tcp"
+	switch ip.Protocol {
+	case layers.IPProtocolTCP:
+		if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+			if tcp, ok := tcpLayer.(*layers.TCP); ok {
+				dstPort = uint16(tcp.DstPort)
+				protocol = "tcp"
+			}
 		}
-	case 17: // UDP
-		if udpHeader, err := parseUDPHeader(payload); err == nil {
-			dstPort = udpHeader.DstPort
-			protocol = "udp"
+	case layers.IPProtocolUDP:
+		if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+			if udp, ok := udpLayer.(*layers.UDP); ok {
+				dstPort = uint16(udp.DstPort)
+				protocol = "udp"
+			}
 		}
-	case 1: // ICMP
+	case layers.IPProtocolICMPv4:
 		protocol = "icmp"
 	default:
 		protocol = "other"
@@ -177,11 +198,15 @@ func (nm *NetworkMonitor) detectSuspiciousActivity() {
 	activeCount := int64(0)
 	suspiciousCount := int64(0)
 	ppsStats := make(map[string]float64)
+	bpsStats := make(map[string]float64)
+	protocolStats := make(map[string]map[string]int64)
 	suspiciousIPs := make(map[string]int64)
 	totalBPS := float64(0)
 
 	for ip, stats := range nm.ipStats {
 		if now.Sub(stats.LastSeen) > time.Minute {
+			// Save final stats before cleaning up
+			SaveIPStats(ip, stats)
 			continue
 		}
 
@@ -195,15 +220,38 @@ func (nm *NetworkMonitor) detectSuspiciousActivity() {
 		bps := float64(stats.ByteCount) / windowDuration
 
 		ppsStats[ip] = pps
+		bpsStats[ip] = bps
+		protocolStats[ip] = stats.Protocols
 		totalBPS += bps
 
 		suspicious := pps > float64(nm.thresholdPPS) || bps > float64(nm.thresholdBandwidth)
 
+		// Check if the IP is a monitored endpoint and if it's suspicious
+		if len(nm.monitoredEndpoints) > 0 {
+			for _, endpoint := range nm.monitoredEndpoints {
+				if ip == endpoint {
+					if suspicious {
+						alertMsgText := fmt.Sprintf("ALERT: Monitored endpoint %s is experiencing suspicious activity - PPS: %.2f, BPS: %.2f", ip, pps, bps)
+						log.Println(alertMsgText) // Keep in log for debugging/persistence
+						if nm.programSend != nil {
+							nm.programSend(alertMsg(alertMsgText))
+						}
+						LogSuspiciousEvent(ip, "DDoS_Attack_Monitored_Endpoint", fmt.Sprintf("PPS: %.2f, BPS: %.2f", pps, bps))
+					}
+					break
+				}
+			}
+		}
+
 		if suspicious && !stats.SuspiciousFlag {
-			log.Printf("ALERT: Suspicious activity from %s - PPS: %.2f, BPS: %.2f",
-				ip, pps, bps)
+			alertMsgText := fmt.Sprintf("ALERT: Suspicious activity from %s - PPS: %.2f, BPS: %.2f", ip, pps, bps)
+			log.Println(alertMsgText) // Keep in log for debugging/persistence
+			if nm.programSend != nil {
+				nm.programSend(alertMsg(alertMsgText))
+			}
 			log.Printf("  Protocols: %v", stats.Protocols)
 			suspiciousCount++
+			LogSuspiciousEvent(ip, "DDoS_Attack_Detected", fmt.Sprintf("PPS: %.2f, BPS: %.2f", pps, bps))
 		}
 
 		stats.SuspiciousFlag = suspicious
@@ -212,13 +260,16 @@ func (nm *NetworkMonitor) detectSuspiciousActivity() {
 		} else {
 			suspiciousIPs[ip] = 0
 		}
+		SaveIPStats(ip, stats)
 	}
 
 	nm.metrics.Set("ddos_active_connections", activeCount)
 	nm.metrics.Set("ddos_suspicious_count", suspiciousCount)
 	nm.metrics.Set("ddos_packets_per_second", ppsStats)
+	nm.metrics.Set("ddos_bytes_per_second_total", totalBPS)
+	nm.metrics.Set("ddos_bytes_per_second_per_ip", bpsStats)
+	nm.metrics.Set("ddos_protocols_per_ip", protocolStats)
 	nm.metrics.Set("ddos_suspicious_ips", suspiciousIPs)
-	nm.metrics.Set("ddos_bytes_per_second", totalBPS)
 }
 
 func (nm *NetworkMonitor) cleanup(ctx context.Context) {
@@ -250,8 +301,8 @@ func (nm *NetworkMonitor) cleanup(ctx context.Context) {
 }
 
 func (nm *NetworkMonitor) Stop() {
-	if nm.conn != nil {
-		nm.conn.Close()
+	if nm.handle != nil {
+		nm.handle.Close()
 	}
 }
 
