@@ -1,0 +1,7 @@
+thresholds:
+  pps: 1000
+  bps: 1000000
+monitored_endpoints: 
+  - 192.168.1.2
+  - 172.21.128.1
+#network_interface: "\\Device\\NPF_{EA798E70-A0FE-4919-AFDF-936B985A2240}"
